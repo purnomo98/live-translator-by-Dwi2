@@ -1,8 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
-
-type Direction = "ID_TO_ZH" | "ZH_TO_ID";
+import { useEffect, useRef, useState } from "react";
 
 type Status =
   | "DISCONNECTED"
@@ -11,123 +9,20 @@ type Status =
   | "SPEAKING"
   | "ERROR";
 
-function downsampleBuffer(
-  buffer: Float32Array<ArrayBufferLike>,
-  inputSampleRate: number,
-  outputSampleRate: number
-): Float32Array<ArrayBufferLike> {
-  if (inputSampleRate === outputSampleRate) {
-    return buffer;
-  }
+type Direction =
+  | "UNKNOWN"
+  | "ID_TO_ZH"
+  | "ZH_TO_ID";
 
-  const ratio = inputSampleRate / outputSampleRate;
-  const newLength = Math.round(buffer.length / ratio);
-  const result = new Float32Array(newLength);
+type SessionName =
+  | "ID_TO_ZH"
+  | "ZH_TO_ID";
 
-  let resultOffset = 0;
-  let bufferOffset = 0;
-
-  while (resultOffset < result.length) {
-    const nextBufferOffset = Math.min(
-      Math.round((resultOffset + 1) * ratio),
-      buffer.length
-    );
-
-    let accumulator = 0;
-    let count = 0;
-
-    for (
-      let i = bufferOffset;
-      i < nextBufferOffset;
-      i++
-    ) {
-      accumulator += buffer[i];
-      count++;
-    }
-
-    result[resultOffset] =
-      count > 0 ? accumulator / count : 0;
-
-    resultOffset++;
-    bufferOffset = nextBufferOffset;
-  }
-
-  return result;
-}
-
-function floatTo16BitPCM(
-  input: Float32Array<ArrayBufferLike>
-): Int16Array<ArrayBufferLike> {
-  const output = new Int16Array(input.length);
-
-  for (let i = 0; i < input.length; i++) {
-    const sample = Math.max(-1, Math.min(1, input[i]));
-
-    output[i] =
-      sample < 0
-        ? sample * 0x8000
-        : sample * 0x7fff;
-  }
-
-  return output;
-}
-
-function int16ToFloat32(
-  input: Int16Array<ArrayBufferLike>
-): Float32Array<ArrayBuffer> {
-  const output = new Float32Array(
-    new ArrayBuffer(input.length * 4)
-  );
-
-  for (let i = 0; i < input.length; i++) {
-    output[i] =
-      input[i] < 0
-        ? input[i] / 0x8000
-        : input[i] / 0x7fff;
-  }
-
-  return output;
-}
-
-function arrayBufferToBase64(
-  buffer: ArrayBufferLike
-): string {
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-
-  let binary = "";
-
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(
-      i,
-      Math.min(i + chunkSize, bytes.length)
-    );
-
-    binary += String.fromCharCode(...chunk);
-  }
-
-  return btoa(binary);
-}
-
-function base64ToInt16(
-  base64: string
-): Int16Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  const usableByteLength =
-    bytes.byteLength - (bytes.byteLength % 2);
-
-  return new Int16Array(
-    bytes.buffer,
-    0,
-    usableByteLength / 2
-  );
-}
+type SetupFlags = {
+  id: boolean;
+  zh: boolean;
+  transcribe: boolean;
+};
 
 export default function Home() {
   const [status, setStatus] =
@@ -137,7 +32,7 @@ export default function Home() {
     useState("Belum terhubung.");
 
   const [direction, setDirection] =
-    useState<Direction>("ID_TO_ZH");
+    useState<Direction>("UNKNOWN");
 
   const [inputText, setInputText] =
     useState("");
@@ -145,70 +40,453 @@ export default function Home() {
   const [outputText, setOutputText] =
     useState("");
 
-  const wsRef =
+  const [idConnected, setIdConnected] =
+    useState(false);
+
+  const [zhConnected, setZhConnected] =
+    useState(false);
+
+  const [transcribeConnected, setTranscribeConnected] =
+    useState(false);
+
+  // =========================
+  // WEBSOCKET REFERENCES
+  // =========================
+
+  const idWsRef =
     useRef<WebSocket | null>(null);
+
+  const zhWsRef =
+    useRef<WebSocket | null>(null);
+
+  const transcribeWsRef =
+    useRef<WebSocket | null>(null);
+
+  // =========================
+  // MICROPHONE REFERENCES
+  // =========================
 
   const micStreamRef =
     useRef<MediaStream | null>(null);
 
-  const inputAudioContextRef =
+  const micContextRef =
     useRef<AudioContext | null>(null);
 
-  const playbackAudioContextRef =
-    useRef<AudioContext | null>(null);
-
-  const sourceRef =
-    useRef<MediaStreamAudioSourceNode | null>(null);
+  const micSourceRef =
+    useRef<MediaStreamAudioSourceNode | null>(
+      null
+    );
 
   const processorRef =
-    useRef<ScriptProcessorNode | null>(null);
+    useRef<ScriptProcessorNode | null>(
+      null
+    );
+
+  // =========================
+  // PLAYBACK REFERENCES
+  // =========================
+
+  const playbackContextRef =
+    useRef<AudioContext | null>(null);
+
+  const playingSourcesRef =
+    useRef<Set<AudioBufferSourceNode>>(
+      new Set()
+    );
 
   const nextPlaybackTimeRef =
     useRef(0);
 
+  // =========================
+  // STATE REFERENCES
+  // =========================
+
+  const activeDirectionRef =
+    useRef<Direction>("UNKNOWN");
+
+  const setupRef =
+    useRef<SetupFlags>({
+      id: false,
+      zh: false,
+      transcribe: false,
+    });
+
+  const microphoneStartedRef =
+    useRef(false);
+
+  const currentInputRef =
+    useRef("");
+
+  const currentOutputRef =
+    useRef("");
+
+  // Audio chunks sementara sebelum bahasa diketahui.
+  const pendingAudioChunksRef =
+    useRef<string[]>([]);
+
+  // Maksimum buffer sekitar beberapa detik.
+  const MAX_PENDING_CHUNKS = 80;
+
   const mountedRef =
     useRef(true);
 
-  function targetLanguageCode() {
-    return direction === "ID_TO_ZH"
-      ? "zh-Hans"
-      : "id";
+  // Digunakan supaya translator yang salah
+  // tidak memutar audio.
+  const turnIdRef =
+    useRef(0);
+
+  const activeTurnIdRef =
+    useRef(0);
+
+  // =========================
+  // CLEANUP
+  // =========================
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    return () => {
+      mountedRef.current = false;
+      cleanup();
+    };
+  }, []);
+
+  function closeSocket(
+    socket: WebSocket | null
+  ) {
+    if (!socket) {
+      return;
+    }
+
+    try {
+      socket.close(1000);
+    } catch {
+      // ignore
+    }
   }
 
-  function directionLabel() {
-    return direction === "ID_TO_ZH"
-      ? "🇮🇩 Indonesia → 🇨🇳 Mandarin"
-      : "🇨🇳 Mandarin → 🇮🇩 Indonesia";
+  function stopPlayback() {
+    for (
+      const source of
+        playingSourcesRef.current
+    ) {
+      try {
+        source.stop();
+      } catch {
+        // already stopped
+      }
+    }
+
+    playingSourcesRef.current.clear();
+    nextPlaybackTimeRef.current = 0;
   }
+
+  function cleanup() {
+    microphoneStartedRef.current = false;
+
+    stopPlayback();
+
+    if (processorRef.current) {
+      try {
+        processorRef.current.disconnect();
+      } catch {}
+
+      processorRef.current = null;
+    }
+
+    if (micSourceRef.current) {
+      try {
+        micSourceRef.current.disconnect();
+      } catch {}
+
+      micSourceRef.current = null;
+    }
+
+    if (micContextRef.current) {
+      void micContextRef.current.close();
+      micContextRef.current = null;
+    }
+
+    if (playbackContextRef.current) {
+      void playbackContextRef.current.close();
+      playbackContextRef.current = null;
+    }
+
+    if (micStreamRef.current) {
+      micStreamRef.current
+        .getTracks()
+        .forEach((track) => track.stop());
+
+      micStreamRef.current = null;
+    }
+
+    closeSocket(idWsRef.current);
+    closeSocket(zhWsRef.current);
+    closeSocket(transcribeWsRef.current);
+
+    idWsRef.current = null;
+    zhWsRef.current = null;
+    transcribeWsRef.current = null;
+
+    setupRef.current = {
+      id: false,
+      zh: false,
+      transcribe: false,
+    };
+
+    activeDirectionRef.current =
+      "UNKNOWN";
+
+    currentInputRef.current = "";
+    currentOutputRef.current = "";
+
+    pendingAudioChunksRef.current = [];
+
+    turnIdRef.current += 1;
+    activeTurnIdRef.current =
+      turnIdRef.current;
+  }
+
+  // =========================
+  // LANGUAGE DETECTION
+  // =========================
+
+  function detectDirectionFromText(
+    text: string
+  ): Direction {
+    const clean =
+      text.trim();
+
+    if (!clean) {
+      return "UNKNOWN";
+    }
+
+    const hanCount =
+      (
+        clean.match(
+          /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g
+        ) || []
+      ).length;
+
+    const latinCount =
+      (
+        clean.match(
+          /[A-Za-zÀ-ÿ]/g
+        ) || []
+      ).length;
+
+    // Mandarin
+    if (
+      hanCount >= 2 &&
+      hanCount >= latinCount
+    ) {
+      return "ZH_TO_ID";
+    }
+
+    // Indonesia / Latin
+    if (
+      latinCount >= 3 &&
+      latinCount > hanCount
+    ) {
+      return "ID_TO_ZH";
+    }
+
+    return "UNKNOWN";
+  }
+
+  function setActiveDirection(
+    newDirection: Direction
+  ) {
+    if (
+      newDirection ===
+      "UNKNOWN"
+    ) {
+      return;
+    }
+
+    if (
+      activeDirectionRef.current !==
+      newDirection
+    ) {
+      stopPlayback();
+
+      currentOutputRef.current =
+        "";
+
+      setOutputText("");
+    }
+
+    activeDirectionRef.current =
+      newDirection;
+
+    setDirection(
+      newDirection
+    );
+
+    if (
+      newDirection ===
+      "ID_TO_ZH"
+    ) {
+      setMessage(
+        "🇮🇩 Indonesia terdeteksi → menerjemahkan ke Mandarin..."
+      );
+    } else {
+      setMessage(
+        "🇨🇳 Mandarin terdeteksi → menerjemahkan ke Indonesia..."
+      );
+    }
+  }
+
+  // =========================
+  // SEND AUDIO BUFFER
+  // =========================
+
+  function sendAudioToSession(
+    session: SessionName,
+    payload: string
+  ) {
+    const socket =
+      session ===
+      "ID_TO_ZH"
+        ? idWsRef.current
+        : zhWsRef.current;
+
+    if (
+      socket &&
+      socket.readyState ===
+        WebSocket.OPEN
+    ) {
+      socket.send(payload);
+    }
+  }
+
+  function sendPendingAudio(
+    session: SessionName
+  ) {
+    const chunks =
+      pendingAudioChunksRef.current;
+
+    if (
+      chunks.length === 0
+    ) {
+      return;
+    }
+
+    console.log(
+      `Sending ${chunks.length} buffered chunks to ${session}`
+    );
+
+    for (
+      const chunk of chunks
+    ) {
+      sendAudioToSession(
+        session,
+        chunk
+      );
+    }
+
+    pendingAudioChunksRef.current =
+      [];
+  }
+
+  // =========================
+  // PLAY AUDIO
+  // =========================
 
   async function playPCM24k(
-    base64Audio: string
+    base64Audio: string,
+    session: SessionName,
+    turnId: number
   ) {
+    // Jangan putar hasil dari sesi yang salah.
+    if (
+      activeDirectionRef.current !==
+      session
+    ) {
+      return;
+    }
+
+    if (
+      activeTurnIdRef.current !==
+      turnId
+    ) {
+      return;
+    }
+
     try {
-      if (!playbackAudioContextRef.current) {
-        playbackAudioContextRef.current =
+      if (
+        !playbackContextRef.current
+      ) {
+        playbackContextRef.current =
           new AudioContext();
       }
 
-      const audioContext =
-        playbackAudioContextRef.current;
+      const context =
+        playbackContextRef.current;
 
-      if (audioContext.state === "suspended") {
-        await audioContext.resume();
+      if (
+        context.state ===
+        "suspended"
+      ) {
+        await context.resume();
       }
 
-      const pcm =
-        base64ToInt16(base64Audio);
+      const binary =
+        atob(base64Audio);
 
-      if (pcm.length === 0) {
+      const usableLength =
+        binary.length -
+        (binary.length % 2);
+
+      if (
+        usableLength <= 0
+      ) {
         return;
       }
 
-      const samples =
-        int16ToFloat32(pcm);
+      const buffer =
+        new ArrayBuffer(
+          usableLength
+        );
 
+      const bytes =
+        new Uint8Array(buffer);
+
+      for (
+        let i = 0;
+        i < usableLength;
+        i++
+      ) {
+        bytes[i] =
+          binary.charCodeAt(i);
+      }
+
+      const pcm =
+        new Int16Array(buffer);
+
+      // Float32Array dengan ArrayBuffer asli
+      // untuk menghindari error TypeScript.
+      const samples =
+        new Float32Array(
+          new ArrayBuffer(
+            pcm.length * 4
+          )
+        );
+
+      for (
+        let i = 0;
+        i < pcm.length;
+        i++
+      ) {
+        samples[i] =
+          pcm[i] < 0
+            ? pcm[i] / 0x8000
+            : pcm[i] / 0x7fff;
+      }
+
+      // Gemini output = 24 kHz PCM
       const audioBuffer =
-        audioContext.createBuffer(
+        context.createBuffer(
           1,
           samples.length,
           24000
@@ -220,22 +498,24 @@ export default function Home() {
       );
 
       const source =
-        audioContext.createBufferSource();
+        context.createBufferSource();
 
-      source.buffer = audioBuffer;
+      source.buffer =
+        audioBuffer;
 
       source.connect(
-        audioContext.destination
+        context.destination
       );
 
       const now =
-        audioContext.currentTime;
+        context.currentTime;
 
       if (
         nextPlaybackTimeRef.current <
         now
       ) {
-        nextPlaybackTimeRef.current = now;
+        nextPlaybackTimeRef.current =
+          now;
       }
 
       source.start(
@@ -245,425 +525,29 @@ export default function Home() {
       nextPlaybackTimeRef.current +=
         audioBuffer.duration;
 
-      if (mountedRef.current) {
-        setStatus("SPEAKING");
-        setMessage("Gemini sedang berbicara...");
-      }
-
-      source.onended = () => {
-        if (
-          !mountedRef.current
-        ) {
-          return;
-        }
-
-        if (
-          audioContext.currentTime >=
-          nextPlaybackTimeRef.current - 0.05
-        ) {
-          setStatus("LISTENING");
-          setMessage("Mendengarkan...");
-        }
-      };
-    } catch (error) {
-      console.error(
-        "AUDIO_PLAYBACK_ERROR",
-        error
-      );
-    }
-  }
-
-  async function startMicrophone() {
-    try {
-      if (!wsRef.current) {
-        throw new Error(
-          "WebSocket belum tersedia."
-        );
-      }
-
-      if (
-        wsRef.current.readyState !==
-        WebSocket.OPEN
-      ) {
-        throw new Error(
-          "WebSocket belum terbuka."
-        );
-      }
-
-      setMessage(
-        "Meminta izin microphone..."
+      playingSourcesRef.current.add(
+        source
       );
 
-      const stream =
-        await navigator.mediaDevices.getUserMedia({
-          audio: {
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-
-      micStreamRef.current = stream;
-
-      const audioContext =
-        new AudioContext();
-
-      inputAudioContextRef.current =
-        audioContext;
-
-      if (audioContext.state === "suspended") {
-        await audioContext.resume();
-      }
-
-      const source =
-        audioContext.createMediaStreamSource(
-          stream
-        );
-
-      sourceRef.current = source;
-
-      const processor =
-        audioContext.createScriptProcessor(
-          4096,
-          1,
-          1
-        );
-
-      processorRef.current = processor;
-
-      processor.onaudioprocess = (
-        event
-      ) => {
-        const ws = wsRef.current;
-
-        if (
-          !ws ||
-          ws.readyState !==
-            WebSocket.OPEN
-        ) {
-          return;
-        }
-
-        const inputData =
-          event.inputBuffer.getChannelData(0);
-
-        const downsampled =
-          downsampleBuffer(
-            inputData,
-            audioContext.sampleRate,
-            16000
-          );
-
-        const pcm =
-          floatTo16BitPCM(
-            downsampled
-          );
-
-        const audioBase64 =
-          arrayBufferToBase64(
-            pcm.buffer
-          );
-
-        const message = {
-          realtimeInput: {
-            audio: {
-              data: audioBase64,
-              mimeType:
-                "audio/pcm;rate=16000",
-            },
-          },
-        };
-
-        ws.send(
-          JSON.stringify(message)
-        );
-      };
-
-      source.connect(processor);
-
-      processor.connect(
-        audioContext.destination
+      setStatus(
+        "SPEAKING"
       );
 
-      setStatus("LISTENING");
-      setMessage("Mendengarkan...");
-
-      console.log(
-        "MIC_STARTED",
-        {
-          sampleRate:
-            audioContext.sampleRate,
-        }
-      );
-    } catch (error) {
-      console.error(
-        "MIC_ERROR",
-        error
-      );
-
-      if (
-        mountedRef.current
-      ) {
-        setStatus("ERROR");
-      }
-
-      if (
-        error instanceof DOMException
-      ) {
-        if (
-          error.name ===
-          "NotAllowedError"
-        ) {
-          setMessage(
-            "Izin microphone ditolak."
-          );
-        } else if (
-          error.name ===
-          "NotFoundError"
-        ) {
-          setMessage(
-            "Microphone tidak ditemukan."
-          );
-        } else {
-          setMessage(
-            `Microphone error: ${error.message}`
-          );
-        }
-      } else {
-        setMessage(
-          error instanceof Error
-            ? error.message
-            : "Gagal mengakses microphone."
-        );
-      }
-    }
-  }
-
-  async function connect() {
-    try {
-      if (
-        status === "CONNECTING" ||
-        status === "LISTENING" ||
-        status === "SPEAKING"
-      ) {
-        return;
-      }
-
-      setInputText("");
-      setOutputText("");
-
-      setStatus("CONNECTING");
-      setMessage(
-        "Meminta ephemeral token..."
-      );
-
-      const response =
-        await fetch(
-          `/api/token?direction=${direction}`,
-          {
-            cache: "no-store",
-          }
-        );
-
-      const tokenData =
-        await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          tokenData.error ||
-            "Gagal mengambil token."
-        );
-      }
-
-      if (!tokenData.token) {
-        throw new Error(
-          "Token tidak tersedia."
-        );
-      }
-
-      setMessage(
-        "Token berhasil. Membuka koneksi..."
-      );
-
-      const wsUrl =
-        "wss://generativelanguage.googleapis.com/ws/" +
-        "google.ai.generativelanguage.v1beta.GenerativeService." +
-        "BidiGenerateContentConstrained?access_token=" +
-        encodeURIComponent(
-          tokenData.token
-        );
-
-      const ws =
-        new WebSocket(wsUrl);
-
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log(
-          "WEBSOCKET_OPEN"
-        );
-
-        const setupMessage = {
-          setup: {
-            model:
-              "models/gemini-3.5-live-translate-preview",
-
-            generationConfig: {
-              responseModalities: [
-                "AUDIO",
-              ],
-
-              translationConfig: {
-                targetLanguageCode:
-                  targetLanguageCode(),
-
-                echoTargetLanguage:
-                  false,
-              },
-            },
-
-            inputAudioTranscription: {},
-
-            outputAudioTranscription: {},
-          },
-        };
-
-        ws.send(
-          JSON.stringify(
-            setupMessage
-          )
-        );
-
-        setMessage(
-          "Gemini menerima koneksi. Menunggu setup..."
-        );
-
-        console.log(
-          "SETUP_SENT"
-        );
-      };
-
-      ws.onmessage = async (
-        event
-      ) => {
-        try {
-          let rawData = "";
-
-          if (
-            typeof event.data ===
-            "string"
-          ) {
-            rawData = event.data;
-          } else if (
-            event.data instanceof Blob
-          ) {
-            rawData =
-              await event.data.text();
-          } else {
-            return;
-          }
-
-          const data =
-            JSON.parse(rawData);
-
-          console.log(
-            "SERVER_MESSAGE",
-            data
+      source.onended =
+        () => {
+          playingSourcesRef.current.delete(
+            source
           );
 
           if (
-            data.setupComplete
-          ) {
-            console.log(
-              "SETUP_COMPLETE"
-            );
-
-            await startMicrophone();
-            return;
-          }
-
-          if (data.error) {
-            console.error(
-              "GEMINI_ERROR",
-              data.error
-            );
-
-            setStatus("ERROR");
-
-            setMessage(
-              data.error.message ||
-                "Gemini mengirim error."
-            );
-
-            return;
-          }
-
-          const serverContent =
-            data.serverContent;
-
-          if (
-            serverContent?.interrupted
-          ) {
-            nextPlaybackTimeRef.current = 0;
-
-            setStatus("LISTENING");
-            setMessage(
-              "Respons disela. Mendengarkan..."
-            );
-
-            return;
-          }
-
-          if (
-            serverContent?.inputTranscription
-              ?.text
-          ) {
-            const text =
-              serverContent
-                .inputTranscription
-                .text;
-
-            setInputText(
-              (current) =>
-                current + text
-            );
-          }
-
-          if (
-            serverContent?.outputTranscription
-              ?.text
-          ) {
-            const text =
-              serverContent
-                .outputTranscription
-                .text;
-
-            setOutputText(
-              (current) =>
-                current + text
-            );
-          }
-
-          const parts =
-            serverContent?.modelTurn
-              ?.parts || [];
-
-          for (
-            const part of parts
-          ) {
-            const audioData =
-              part.inlineData?.data;
-
-            if (audioData) {
-              await playPCM24k(
-                audioData
-              );
-            }
-          }
-
-          if (
-            serverContent?.turnComplete
+            mountedRef.current &&
+            activeDirectionRef.current ===
+              session &&
+            activeTurnIdRef.current ===
+              turnId &&
+            context.currentTime >=
+              nextPlaybackTimeRef.current -
+                0.05
           ) {
             setStatus(
               "LISTENING"
@@ -673,64 +557,1285 @@ export default function Home() {
               "Mendengarkan..."
             );
           }
-        } catch (error) {
-          console.error(
-            "MESSAGE_ERROR",
-            error
-          );
-        }
-      };
+        };
+    } catch (error) {
+      console.error(
+        "PLAYBACK_ERROR",
+        error
+      );
+    }
+  }
 
-      ws.onerror = (error) => {
-        console.error(
-          "WEBSOCKET_ERROR",
-          error
-        );
+  // =========================
+  // TRANSLATION MESSAGE
+  // =========================
 
-        setStatus("ERROR");
-        setMessage(
-          "WebSocket error."
-        );
-      };
+  async function handleTranslationMessage(
+    session: SessionName,
+    event: MessageEvent
+  ) {
+    try {
+      let raw = "";
 
-      ws.onclose = (event) => {
+      if (
+        typeof event.data ===
+        "string"
+      ) {
+        raw =
+          event.data;
+      } else if (
+        event.data instanceof Blob
+      ) {
+        raw =
+          await event.data.text();
+      } else {
+        return;
+      }
+
+      const data =
+        JSON.parse(raw);
+
+      console.log(
+        `[${session}]`,
+        data
+      );
+
+      if (
+        data.setupComplete
+      ) {
         console.log(
-          "WEBSOCKET_CLOSED",
-          event.code,
-          event.reason
+          `${session}: SETUP_COMPLETE`
         );
 
-        wsRef.current = null;
+        return;
+      }
+
+      if (
+        data.error
+      ) {
+        console.error(
+          `${session}: GEMINI_ERROR`,
+          data.error
+        );
 
         if (
-          event.code === 1000
+          mountedRef.current
         ) {
           setStatus(
-            "DISCONNECTED"
+            "ERROR"
           );
 
           setMessage(
-            "Koneksi dihentikan."
-          );
-        } else {
-          setStatus("ERROR");
-
-          setMessage(
-            `Koneksi ditutup. Code ${event.code}${
-              event.reason
-                ? ` - ${event.reason}`
-                : ""
-            }`
+            data.error.message ||
+              `${session} error`
           );
         }
+
+        return;
+      }
+
+      const content =
+        data.serverContent;
+
+      if (!content) {
+        return;
+      }
+
+      // User interruption
+      if (
+        content.interrupted
+      ) {
+        stopPlayback();
+
+        if (
+          activeDirectionRef.current ===
+          session
+        ) {
+          setStatus(
+            "LISTENING"
+          );
+
+          setMessage(
+            "Respons dihentikan. Mendengarkan..."
+          );
+        }
+
+        return;
+      }
+
+      // Input transcript
+      const inputChunk =
+        content
+          .inputTranscription
+          ?.text || "";
+
+      if (
+        inputChunk &&
+        activeDirectionRef.current ===
+          session
+      ) {
+        currentInputRef.current +=
+          inputChunk;
+
+        setInputText(
+          currentInputRef.current
+        );
+      }
+
+      // Output transcript
+      const outputChunk =
+        content
+          .outputTranscription
+          ?.text || "";
+
+      if (
+        outputChunk &&
+        activeDirectionRef.current ===
+          session
+      ) {
+        currentOutputRef.current +=
+          outputChunk;
+
+        setOutputText(
+          currentOutputRef.current
+        );
+      }
+
+      // AUDIO
+      const parts =
+        content
+          .modelTurn
+          ?.parts || [];
+
+      for (
+        const part of parts
+      ) {
+        const audio =
+          part.inlineData
+            ?.data;
+
+        if (!audio) {
+          continue;
+        }
+
+        const currentTurn =
+          activeTurnIdRef.current;
+
+        await playPCM24k(
+          audio,
+          session,
+          currentTurn
+        );
+      }
+
+      if (
+        content.turnComplete &&
+        activeDirectionRef.current ===
+          session
+      ) {
+        setStatus(
+          "LISTENING"
+        );
+
+        setMessage(
+          "Mendengarkan..."
+        );
+      }
+    } catch (error) {
+      console.error(
+        `${session}: MESSAGE_ERROR`,
+        error
+      );
+    }
+  }
+
+  // =========================
+  // TRANSCRIPTION MESSAGE
+  // =========================
+
+  async function handleTranscriptionMessage(
+    event: MessageEvent
+  ) {
+    try {
+      let raw = "";
+
+      if (
+        typeof event.data ===
+        "string"
+      ) {
+        raw =
+          event.data;
+      } else if (
+        event.data instanceof Blob
+      ) {
+        raw =
+          await event.data.text();
+      } else {
+        return;
+      }
+
+      const data =
+        JSON.parse(raw);
+
+      console.log(
+        "[TRANSCRIBE]",
+        data
+      );
+
+      if (
+        data.setupComplete
+      ) {
+        console.log(
+          "TRANSCRIBE: SETUP_COMPLETE"
+        );
+
+        return;
+      }
+
+      if (
+        data.error
+      ) {
+        console.error(
+          "TRANSCRIBE_ERROR",
+          data.error
+        );
+
+        setStatus(
+          "ERROR"
+        );
+
+        setMessage(
+          data.error.message ||
+            "Language detector error."
+        );
+
+        return;
+      }
+
+      const content =
+        data.serverContent;
+
+      if (!content) {
+        return;
+      }
+
+      /*
+       * Interim transcript:
+       * ini yang kita gunakan untuk
+       * menentukan arah secepat mungkin.
+       */
+      const interim =
+        content
+          .interimInputTranscription
+          ?.text || "";
+
+      if (interim) {
+        const detected =
+          detectDirectionFromText(
+            interim
+          );
+
+        if (
+          detected !==
+          "UNKNOWN"
+        ) {
+          if (
+            activeDirectionRef.current !==
+            detected
+          ) {
+            setActiveDirection(
+              detected
+            );
+
+            activeTurnIdRef.current +=
+              1;
+
+            currentInputRef.current =
+              interim;
+
+            currentOutputRef.current =
+              "";
+
+            setInputText(
+              interim
+            );
+
+            setOutputText("");
+
+            /*
+             * Sekarang kirim seluruh
+             * audio yang sudah kita buffer
+             * ke translator yang benar.
+             */
+            sendPendingAudio(
+              detected
+            );
+          } else {
+            currentInputRef.current =
+              interim;
+
+            setInputText(
+              interim
+            );
+          }
+        }
+
+        return;
+      }
+
+      /*
+       * Final transcript
+       */
+      const finalChunk =
+        content
+          .inputTranscription
+          ?.text || "";
+
+      if (
+        finalChunk
+      ) {
+        const combined =
+          currentInputRef.current +
+          finalChunk;
+
+        currentInputRef.current =
+          combined;
+
+        setInputText(
+          combined
+        );
+
+        const detected =
+          detectDirectionFromText(
+            combined
+          );
+
+        if (
+          detected !==
+          "UNKNOWN"
+        ) {
+          if (
+            activeDirectionRef.current !==
+            detected
+          ) {
+            setActiveDirection(
+              detected
+            );
+
+            activeTurnIdRef.current +=
+              1;
+
+            sendPendingAudio(
+              detected
+            );
+          }
+        }
+      }
+
+      /*
+       * Turn complete
+       */
+      if (
+        content.turnComplete
+      ) {
+        setStatus(
+          "LISTENING"
+        );
+
+        setMessage(
+          "Mendengarkan..."
+        );
+
+        /*
+         * Setelah giliran selesai,
+         * arah direset agar lawan bicara
+         * bisa menggunakan bahasa lain.
+         */
+        window.setTimeout(
+          () => {
+            if (
+              mountedRef.current
+            ) {
+              activeDirectionRef.current =
+                "UNKNOWN";
+
+              currentInputRef.current =
+                "";
+
+              currentOutputRef.current =
+                "";
+
+              pendingAudioChunksRef.current =
+                [];
+
+              setDirection(
+                "UNKNOWN"
+              );
+
+              setInputText("");
+              setOutputText("");
+
+              setMessage(
+                "Mendeteksi bahasa berikutnya..."
+              );
+            }
+          },
+          300
+        );
+      }
+    } catch (error) {
+      console.error(
+        "TRANSCRIBE_MESSAGE_ERROR",
+        error
+      );
+    }
+  }
+
+  // =========================
+  // MICROPHONE
+  // =========================
+
+  async function startMicrophone() {
+    if (
+      microphoneStartedRef.current
+    ) {
+      return;
+    }
+
+    const idWs =
+      idWsRef.current;
+
+    const zhWs =
+      zhWsRef.current;
+
+    const transcribeWs =
+      transcribeWsRef.current;
+
+    if (
+      !idWs ||
+      !zhWs ||
+      !transcribeWs
+    ) {
+      throw new Error(
+        "WebSocket belum lengkap."
+      );
+    }
+
+    if (
+      idWs.readyState !==
+        WebSocket.OPEN ||
+      zhWs.readyState !==
+        WebSocket.OPEN ||
+      transcribeWs.readyState !==
+        WebSocket.OPEN
+    ) {
+      throw new Error(
+        "Semua WebSocket belum siap."
+      );
+    }
+
+    microphoneStartedRef.current =
+      true;
+
+    const stream =
+      await navigator.mediaDevices.getUserMedia(
+        {
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        }
+      );
+
+    micStreamRef.current =
+      stream;
+
+    const context =
+      new AudioContext();
+
+    micContextRef.current =
+      context;
+
+    if (
+      context.state ===
+      "suspended"
+    ) {
+      await context.resume();
+    }
+
+    const source =
+      context.createMediaStreamSource(
+        stream
+      );
+
+    micSourceRef.current =
+      source;
+
+    /*
+     * 2048 frame.
+     */
+    const processor =
+      context.createScriptProcessor(
+        2048,
+        1,
+        1
+      );
+
+    processorRef.current =
+      processor;
+
+    processor.onaudioprocess =
+      (event) => {
+        const input =
+          event.inputBuffer.getChannelData(
+            0
+          );
+
+        const inputRate =
+          context.sampleRate;
+
+        const targetRate =
+          16000;
+
+        const ratio =
+          inputRate /
+          targetRate;
+
+        const outputLength =
+          Math.round(
+            input.length /
+              ratio
+          );
+
+        const resampled =
+          new Float32Array(
+            outputLength
+          );
+
+        for (
+          let i = 0;
+          i < outputLength;
+          i++
+        ) {
+          const start =
+            Math.floor(
+              i * ratio
+            );
+
+          const end =
+            Math.min(
+              Math.floor(
+                (i + 1) * ratio
+              ),
+              input.length
+            );
+
+          let sum = 0;
+          let count = 0;
+
+          for (
+            let j = start;
+            j < end;
+            j++
+          ) {
+            sum += input[j];
+            count++;
+          }
+
+          resampled[i] =
+            count > 0
+              ? sum / count
+              : 0;
+        }
+
+        const pcm =
+          new Int16Array(
+            new ArrayBuffer(
+              resampled.length *
+                2
+            )
+          );
+
+        for (
+          let i = 0;
+          i < resampled.length;
+          i++
+        ) {
+          const sample =
+            Math.max(
+              -1,
+              Math.min(
+                1,
+                resampled[i]
+              )
+            );
+
+          pcm[i] =
+            sample < 0
+              ? sample * 0x8000
+              : sample * 0x7fff;
+        }
+
+        const bytes =
+          new Uint8Array(
+            pcm.buffer
+          );
+
+        let binary = "";
+
+        const chunkSize =
+          0x8000;
+
+        for (
+          let i = 0;
+          i < bytes.length;
+          i += chunkSize
+        ) {
+          const chunk =
+            bytes.subarray(
+              i,
+              Math.min(
+                i +
+                  chunkSize,
+                bytes.length
+              )
+            );
+
+          binary +=
+            String.fromCharCode(
+              ...chunk
+            );
+        }
+
+        const payload =
+          JSON.stringify({
+            realtimeInput: {
+              audio: {
+                data:
+                  btoa(binary),
+                mimeType:
+                  "audio/pcm;rate=16000",
+              },
+            },
+          });
+
+        /*
+         * 1. Selalu kirim ke transcriber
+         */
+        if (
+          transcribeWs.readyState ===
+          WebSocket.OPEN
+        ) {
+          transcribeWs.send(
+            payload
+          );
+        }
+
+        /*
+         * 2. Jika bahasa belum diketahui,
+         * simpan audio sementara.
+         */
+        if (
+          activeDirectionRef.current ===
+          "UNKNOWN"
+        ) {
+          pendingAudioChunksRef.current.push(
+            payload
+          );
+
+          if (
+            pendingAudioChunksRef.current
+              .length >
+            MAX_PENDING_CHUNKS
+          ) {
+            pendingAudioChunksRef.current.shift();
+          }
+
+          return;
+        }
+
+        /*
+         * 3. Setelah bahasa diketahui,
+         * hanya kirim ke translator yang benar.
+         */
+        if (
+          activeDirectionRef.current ===
+          "ID_TO_ZH"
+        ) {
+          if (
+            idWs.readyState ===
+            WebSocket.OPEN
+          ) {
+            idWs.send(
+              payload
+            );
+          }
+        } else if (
+          activeDirectionRef.current ===
+          "ZH_TO_ID"
+        ) {
+          if (
+            zhWs.readyState ===
+            WebSocket.OPEN
+          ) {
+            zhWs.send(
+              payload
+            );
+          }
+        }
       };
+
+    source.connect(
+      processor
+    );
+
+    /*
+     * ScriptProcessor perlu terhubung ke
+     * destination agar callback tetap aktif.
+     */
+    processor.connect(
+      context.destination
+    );
+
+    setStatus(
+      "LISTENING"
+    );
+
+    setMessage(
+      "Mendengarkan dan mendeteksi bahasa..."
+    );
+
+    console.log(
+      "MIC_STARTED",
+      context.sampleRate
+    );
+  }
+
+  // =========================
+  // SETUP HELPER
+  // =========================
+
+  function markSetup(
+    name: keyof SetupFlags
+  ) {
+    setupRef.current[name] =
+      true;
+
+    console.log(
+      `SETUP_COMPLETE: ${name}`
+    );
+
+    const ready =
+      setupRef.current.id &&
+      setupRef.current.zh &&
+      setupRef.current.transcribe;
+
+    if (
+      ready &&
+      !microphoneStartedRef.current
+    ) {
+      void startMicrophone().catch(
+        (error) => {
+          console.error(
+            "START_MIC_ERROR",
+            error
+          );
+
+          setStatus(
+            "ERROR"
+          );
+
+          setMessage(
+            error instanceof Error
+              ? error.message
+              : "Gagal memulai microphone."
+          );
+        }
+      );
+    }
+  }
+
+  function parseMessageData(
+    event: MessageEvent
+  ): Promise<string> | string {
+    if (
+      typeof event.data ===
+      "string"
+    ) {
+      return event.data;
+    }
+
+    if (
+      event.data instanceof Blob
+    ) {
+      return event.data.text();
+    }
+
+    return "";
+  }
+
+  // =========================
+  // CONNECT
+  // =========================
+
+  async function connect() {
+    try {
+      cleanup();
+
+      setStatus(
+        "CONNECTING"
+      );
+
+      setMessage(
+        "Meminta ephemeral token..."
+      );
+
+      setDirection(
+        "UNKNOWN"
+      );
+
+      setInputText("");
+      setOutputText("");
+
+      const response =
+        await fetch(
+          "/api/token",
+          {
+            cache:
+              "no-store",
+          }
+        );
+
+      const rawResponse =
+        await response.text();
+
+      let tokens: Record<
+        string,
+        string
+      >;
+
+      try {
+        tokens =
+          JSON.parse(
+            rawResponse
+          );
+      } catch {
+        throw new Error(
+          "Server /api/token tidak mengembalikan JSON."
+        );
+      }
+
+      if (
+        !response.ok
+      ) {
+        throw new Error(
+          tokens.error ||
+            "Gagal mendapatkan token."
+        );
+      }
+
+      if (
+        !tokens
+          .indonesiaToChinese ||
+        !tokens
+          .chineseToIndonesia ||
+        !tokens.transcribe
+      ) {
+        throw new Error(
+          "Tiga token Gemini tidak lengkap."
+        );
+      }
+
+      const baseUrl =
+        "wss://generativelanguage.googleapis.com/ws/" +
+        "google.ai.generativelanguage.v1beta.GenerativeService." +
+        "BidiGenerateContentConstrained?access_token=";
+
+      const idWs =
+        new WebSocket(
+          baseUrl +
+            encodeURIComponent(
+              tokens
+                .indonesiaToChinese
+            )
+        );
+
+      const zhWs =
+        new WebSocket(
+          baseUrl +
+            encodeURIComponent(
+              tokens
+                .chineseToIndonesia
+            )
+        );
+
+      const transcribeWs =
+        new WebSocket(
+          baseUrl +
+            encodeURIComponent(
+              tokens.transcribe
+            )
+        );
+
+      idWsRef.current =
+        idWs;
+
+      zhWsRef.current =
+        zhWs;
+
+      transcribeWsRef.current =
+        transcribeWs;
+
+      // =========================
+      // ID -> ZH
+      // =========================
+
+      idWs.onopen = () => {
+        console.log(
+          "ID_TO_ZH: WEBSOCKET_OPEN"
+        );
+
+        setIdConnected(true);
+
+        idWs.send(
+          JSON.stringify({
+            setup: {
+              model:
+                "models/gemini-3.5-live-translate-preview",
+
+              generationConfig: {
+                responseModalities: [
+                  "AUDIO",
+                ],
+
+                translationConfig: {
+                  targetLanguageCode:
+                    "zh-Hans",
+
+                  echoTargetLanguage:
+                    false,
+                },
+              },
+
+              inputAudioTranscription:
+                {},
+
+              outputAudioTranscription:
+                {},
+            },
+          })
+        );
+      };
+
+      // =========================
+      // ZH -> ID
+      // =========================
+
+      zhWs.onopen = () => {
+        console.log(
+          "ZH_TO_ID: WEBSOCKET_OPEN"
+        );
+
+        setZhConnected(true);
+
+        zhWs.send(
+          JSON.stringify({
+            setup: {
+              model:
+                "models/gemini-3.5-live-translate-preview",
+
+              generationConfig: {
+                responseModalities: [
+                  "AUDIO",
+                ],
+
+                translationConfig: {
+                  targetLanguageCode:
+                    "id",
+
+                  echoTargetLanguage:
+                    false,
+                },
+              },
+
+              inputAudioTranscription:
+                {},
+
+              outputAudioTranscription:
+                {},
+            },
+          })
+        );
+      };
+
+      // =========================
+      // TRANSCRIBER
+      // =========================
+
+      transcribeWs.onopen =
+        () => {
+          console.log(
+            "TRANSCRIBE: WEBSOCKET_OPEN"
+          );
+
+          setTranscribeConnected(
+            true
+          );
+
+          transcribeWs.send(
+            JSON.stringify({
+              setup: {
+                model:
+                  "models/gemini-3.5-transcribe-live",
+
+                generationConfig: {
+                  responseModalities: [
+                    "TEXT",
+                  ],
+                },
+
+                inputAudioTranscription: {
+                  languageCodes: [],
+                },
+              },
+            })
+          );
+        };
+
+      // =========================
+      // ID MESSAGE
+      // =========================
+
+      idWs.onmessage =
+        async (event) => {
+          try {
+            const raw =
+              await parseMessageData(
+                event
+              );
+
+            const data =
+              JSON.parse(raw);
+
+            if (
+              data.setupComplete
+            ) {
+              markSetup("id");
+              return;
+            }
+
+            await handleTranslationMessage(
+              "ID_TO_ZH",
+              event
+            );
+          } catch (error) {
+            console.error(
+              "ID_WS_MESSAGE_ERROR",
+              error
+            );
+          }
+        };
+
+      // =========================
+      // ZH MESSAGE
+      // =========================
+
+      zhWs.onmessage =
+        async (event) => {
+          try {
+            const raw =
+              await parseMessageData(
+                event
+              );
+
+            const data =
+              JSON.parse(raw);
+
+            if (
+              data.setupComplete
+            ) {
+              markSetup("zh");
+              return;
+            }
+
+            await handleTranslationMessage(
+              "ZH_TO_ID",
+              event
+            );
+          } catch (error) {
+            console.error(
+              "ZH_WS_MESSAGE_ERROR",
+              error
+            );
+          }
+        };
+
+      // =========================
+      // TRANSCRIBE MESSAGE
+      // =========================
+
+      transcribeWs.onmessage =
+        async (event) => {
+          try {
+            const raw =
+              await parseMessageData(
+                event
+              );
+
+            const data =
+              JSON.parse(raw);
+
+            if (
+              data.setupComplete
+            ) {
+              markSetup(
+                "transcribe"
+              );
+              return;
+            }
+
+            await handleTranscriptionMessage(
+              event
+            );
+          } catch (error) {
+            console.error(
+              "TRANSCRIBE_WS_MESSAGE_ERROR",
+              error
+            );
+          }
+        };
+
+      // =========================
+      // ERRORS
+      // =========================
+
+      idWs.onerror =
+        (error) => {
+          console.error(
+            "ID_TO_ZH_WEBSOCKET_ERROR",
+            error
+          );
+        };
+
+      zhWs.onerror =
+        (error) => {
+          console.error(
+            "ZH_TO_ID_WEBSOCKET_ERROR",
+            error
+          );
+        };
+
+      transcribeWs.onerror =
+        (error) => {
+          console.error(
+            "TRANSCRIBE_WEBSOCKET_ERROR",
+            error
+          );
+        };
+
+      // =========================
+      // CLOSE
+      // =========================
+
+      idWs.onclose =
+        (event) => {
+          console.log(
+            "ID_TO_ZH_CLOSED",
+            event.code,
+            event.reason
+          );
+
+          setIdConnected(false);
+
+          if (
+            event.code !==
+              1000 &&
+            mountedRef.current
+          ) {
+            setStatus(
+              "ERROR"
+            );
+
+            setMessage(
+              `Indonesia → Mandarin terputus. Code ${event.code}${
+                event.reason
+                  ? ` - ${event.reason}`
+                  : ""
+              }`
+            );
+          }
+        };
+
+      zhWs.onclose =
+        (event) => {
+          console.log(
+            "ZH_TO_ID_CLOSED",
+            event.code,
+            event.reason
+          );
+
+          setZhConnected(false);
+
+          if (
+            event.code !==
+              1000 &&
+            mountedRef.current
+          ) {
+            setStatus(
+              "ERROR"
+            );
+
+            setMessage(
+              `Mandarin → Indonesia terputus. Code ${event.code}${
+                event.reason
+                  ? ` - ${event.reason}`
+                  : ""
+              }`
+            );
+          }
+        };
+
+      transcribeWs.onclose =
+        (event) => {
+          console.log(
+            "TRANSCRIBE_CLOSED",
+            event.code,
+            event.reason
+          );
+
+          setTranscribeConnected(
+            false
+          );
+
+          if (
+            event.code !==
+              1000 &&
+            mountedRef.current
+          ) {
+            setStatus(
+              "ERROR"
+            );
+
+            setMessage(
+              `Language detector terputus. Code ${event.code}${
+                event.reason
+                  ? ` - ${event.reason}`
+                  : ""
+              }`
+            );
+          }
+        };
     } catch (error) {
       console.error(
         "CONNECT_ERROR",
         error
       );
 
-      setStatus("ERROR");
+      setStatus(
+        "ERROR"
+      );
 
       setMessage(
         error instanceof Error
@@ -740,213 +1845,148 @@ export default function Home() {
     }
   }
 
+  // =========================
+  // DISCONNECT
+  // =========================
+
   function disconnect() {
-    if (
-      processorRef.current
-    ) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
+    cleanup();
 
-    if (sourceRef.current) {
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
-
-    if (
-      inputAudioContextRef.current
-    ) {
-      inputAudioContextRef.current.close();
-      inputAudioContextRef.current =
-        null;
-    }
-
-    if (
-      playbackAudioContextRef.current
-    ) {
-      playbackAudioContextRef.current.close();
-      playbackAudioContextRef.current =
-        null;
-    }
-
-    if (
-      micStreamRef.current
-    ) {
-      micStreamRef.current
-        .getTracks()
-        .forEach((track) => {
-          track.stop();
-        });
-
-      micStreamRef.current = null;
-    }
-
-    if (wsRef.current) {
-      wsRef.current.close(1000);
-      wsRef.current = null;
-    }
-
-    nextPlaybackTimeRef.current = 0;
+    setIdConnected(false);
+    setZhConnected(false);
+    setTranscribeConnected(false);
 
     setStatus(
       "DISCONNECTED"
     );
+
+    setDirection(
+      "UNKNOWN"
+    );
+
+    setInputText("");
+    setOutputText("");
 
     setMessage(
       "Terputus."
     );
   }
 
-  function changeDirection(
-    newDirection: Direction
-  ) {
-    if (
-      status !==
-      "DISCONNECTED"
-    ) {
-      disconnect();
-    }
-
-    setInputText("");
-    setOutputText("");
-
-    setDirection(
-      newDirection
-    );
-  }
+  // =========================
+  // UI
+  // =========================
 
   return (
-    <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4">
-      <div className="w-full max-w-5xl">
+    <main className="min-h-screen bg-slate-950 px-4 py-6 text-white">
+      <div className="mx-auto w-full max-w-5xl">
+
         <div className="overflow-hidden rounded-3xl border border-slate-800 bg-slate-900 shadow-2xl">
 
           {/* HEADER */}
           <div className="flex flex-col gap-4 border-b border-slate-800 px-6 py-5 sm:flex-row sm:items-center sm:justify-between">
+
             <div>
-              <h1 className="text-3xl font-bold">
+              <h1 className="text-2xl font-bold sm:text-3xl">
                 Gemini Live Translator
               </h1>
 
-              <p className="mt-1 text-slate-400">
+              <p className="mt-1 text-sm text-slate-400">
                 Indonesia ↔ Mandarin
               </p>
             </div>
 
-            <div className="rounded-full border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold">
+            <div className="rounded-full border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-bold">
               {status}
             </div>
+
           </div>
 
           <div className="p-6 sm:p-8">
 
-            {/* DIRECTION */}
-            <div className="grid gap-4 md:grid-cols-2">
+            {/* AUTO MODE */}
+            <div className="rounded-2xl border border-blue-500/30 bg-blue-950/20 p-5">
 
-              <button
-                onClick={() =>
-                  changeDirection(
-                    "ID_TO_ZH"
-                  )
-                }
-                className={`rounded-2xl border p-5 text-left transition ${
-                  direction ===
-                  "ID_TO_ZH"
-                    ? "border-blue-500 bg-blue-600"
-                    : "border-slate-800 bg-slate-950 hover:bg-slate-800"
-                }`}
-              >
-                <div className="text-sm opacity-80">
-                  Bahasa Indonesia
-                </div>
+              <div className="text-sm font-semibold text-blue-300">
+                🔄 AUTO TRANSLATION
+              </div>
 
-                <div className="mt-2 text-lg font-bold">
-                  🇮🇩 Indonesia
-                  <span className="mx-3">
-                    →
-                  </span>
-                  🇨🇳 Mandarin
-                </div>
-              </button>
+              <div className="mt-2 text-xl font-bold">
+                Indonesia ↔ Mandarin
+              </div>
 
-              <button
-                onClick={() =>
-                  changeDirection(
-                    "ZH_TO_ID"
-                  )
-                }
-                className={`rounded-2xl border p-5 text-left transition ${
-                  direction ===
-                  "ZH_TO_ID"
-                    ? "border-blue-500 bg-blue-600"
-                    : "border-slate-800 bg-slate-950 hover:bg-slate-800"
-                }`}
-              >
-                <div className="text-sm opacity-80">
-                  Bahasa Mandarin
-                </div>
-
-                <div className="mt-2 text-lg font-bold">
-                  🇨🇳 Mandarin
-                  <span className="mx-3">
-                    →
-                  </span>
-                  🇮🇩 Indonesia
-                </div>
-              </button>
+              <p className="mt-2 text-sm leading-6 text-slate-400">
+                Tidak perlu memilih arah.
+                Bahasa dideteksi otomatis
+                saat kamu berbicara.
+              </p>
 
             </div>
 
-            {/* STATUS */}
-            <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-950 p-6 text-center">
+            {/* LANGUAGE */}
+            <div className="mt-5 rounded-2xl border border-slate-800 bg-slate-950 p-6 text-center">
+
               <div className="text-xs font-semibold uppercase tracking-widest text-slate-500">
-                STATUS
+                BAHASA TERDETEKSI
               </div>
 
-              <div className="mt-2 text-3xl font-bold">
-                {status}
+              <div className="mt-3 text-2xl font-bold">
+                {direction ===
+                  "ID_TO_ZH" &&
+                  "🇮🇩 Indonesia"}
+
+                {direction ===
+                  "ZH_TO_ID" &&
+                  "🇨🇳 Mandarin"}
+
+                {direction ===
+                  "UNKNOWN" &&
+                  "Menunggu bahasa..."}
               </div>
 
-              <div className="mt-2 text-slate-300">
+              <div className="mt-3 text-sm text-slate-300">
                 {message}
               </div>
 
-              <div className="mt-2 text-sm text-slate-500">
-                {directionLabel()}
-              </div>
             </div>
 
             {/* TRANSCRIPT */}
             <div className="mt-6 grid gap-4 lg:grid-cols-2">
 
               <div className="rounded-2xl border border-slate-800 bg-slate-950 p-5">
+
                 <div className="font-semibold">
                   🎙️ Bahasa Asli
                 </div>
 
-                <div className="mt-4 min-h-40 rounded-xl bg-slate-900 p-4 text-slate-200 whitespace-pre-wrap">
+                <div className="mt-4 min-h-44 rounded-xl bg-slate-900 p-4 text-slate-200 whitespace-pre-wrap">
                   {inputText ||
                     "Menunggu suara..."}
                 </div>
+
               </div>
 
               <div className="rounded-2xl border border-slate-800 bg-slate-950 p-5">
+
                 <div className="font-semibold">
                   🔊 Hasil Terjemahan
                 </div>
 
-                <div className="mt-4 min-h-40 rounded-xl bg-slate-900 p-4 text-slate-200 whitespace-pre-wrap">
+                <div className="mt-4 min-h-44 rounded-xl bg-slate-900 p-4 text-slate-200 whitespace-pre-wrap">
                   {outputText ||
                     "Menunggu terjemahan..."}
                 </div>
+
               </div>
 
             </div>
 
             {/* BUTTONS */}
-            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+            <div className="mt-6 flex gap-3">
 
               <button
-                onClick={connect}
+                onClick={() => {
+                  void connect();
+                }}
                 disabled={
                   status ===
                     "CONNECTING" ||
@@ -961,11 +2001,72 @@ export default function Home() {
               </button>
 
               <button
-                onClick={disconnect}
+                onClick={
+                  disconnect
+                }
                 className="flex-1 rounded-xl bg-slate-700 px-6 py-4 font-bold transition hover:bg-slate-600"
               >
                 ⏹ STOP
               </button>
+
+            </div>
+
+            {/* CONNECTION STATUS */}
+            <div className="mt-5 grid gap-3 md:grid-cols-3">
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-4 text-center">
+
+                <div className="text-xs text-slate-500">
+                  TRANSLATOR 1
+                </div>
+
+                <div className="mt-1 font-semibold">
+                  🇮🇩 → 🇨🇳
+                </div>
+
+                <div className="mt-1 text-xs text-slate-400">
+                  {idConnected
+                    ? "Connected"
+                    : "Disconnected"}
+                </div>
+
+              </div>
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-4 text-center">
+
+                <div className="text-xs text-slate-500">
+                  TRANSLATOR 2
+                </div>
+
+                <div className="mt-1 font-semibold">
+                  🇨🇳 → 🇮🇩
+                </div>
+
+                <div className="mt-1 text-xs text-slate-400">
+                  {zhConnected
+                    ? "Connected"
+                    : "Disconnected"}
+                </div>
+
+              </div>
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-4 text-center">
+
+                <div className="text-xs text-slate-500">
+                  LANGUAGE DETECTOR
+                </div>
+
+                <div className="mt-1 font-semibold">
+                  AUTO
+                </div>
+
+                <div className="mt-1 text-xs text-slate-400">
+                  {transcribeConnected
+                    ? "Connected"
+                    : "Disconnected"}
+                </div>
+
+              </div>
 
             </div>
 

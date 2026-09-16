@@ -1,85 +1,223 @@
 import { GoogleGenAI, Modality } from "@google/genai";
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 
-export async function GET(
-  request: NextRequest
-) {
+export async function GET() {
+  const result: {
+    indonesiaToChinese?: string;
+    chineseToIndonesia?: string;
+    transcribe?: string;
+    errors: string[];
+  } = {
+    errors: [],
+  };
+
   try {
-    const apiKey =
-      process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return NextResponse.json(
         {
-          error:
-            "GEMINI_API_KEY tidak ditemukan.",
+          error: "GEMINI_API_KEY tidak ditemukan.",
         },
         { status: 500 }
       );
     }
 
-    const direction =
-      request.nextUrl.searchParams.get(
-        "direction"
-      ) || "ID_TO_ZH";
+    const client = new GoogleGenAI({
+      apiKey,
+    });
 
-    const targetLanguageCode =
-      direction === "ZH_TO_ID"
-        ? "id"
-        : "zh-Hans";
+    const expireTime = new Date(
+      Date.now() + 30 * 60 * 1000
+    ).toISOString();
 
-    const client =
-      new GoogleGenAI({
-        apiKey,
-      });
+    const newSessionExpireTime = new Date(
+      Date.now() + 60 * 1000
+    ).toISOString();
 
-    const token =
-      await client.authTokens.create({
-        config: {
-          uses: 1,
+    // ========================================
+    // TOKEN 1: INDONESIA -> MANDARIN
+    // ========================================
+    try {
+      const token =
+        await client.authTokens.create({
+          config: {
+            uses: 1,
+            expireTime,
+            newSessionExpireTime,
 
-          expireTime:
-            new Date(
-              Date.now() +
-                30 * 60 * 1000
-            ).toISOString(),
+            liveConnectConstraints: {
+              model:
+                "gemini-3.5-live-translate-preview",
 
-          newSessionExpireTime:
-            new Date(
-              Date.now() +
-                60 * 1000
-            ).toISOString(),
+              config: {
+                responseModalities: [
+                  Modality.AUDIO,
+                ],
 
-          liveConnectConstraints: {
-            model:
-              "gemini-3.5-live-translate-preview",
+                inputAudioTranscription: {},
 
-            config: {
-              responseModalities: [
-                Modality.AUDIO,
-              ],
+                outputAudioTranscription: {},
 
-              translationConfig: {
-                targetLanguageCode,
-                echoTargetLanguage: false,
+                translationConfig: {
+                  targetLanguageCode:
+                    "zh-Hans",
+                  echoTargetLanguage:
+                    false,
+                },
               },
-
-              inputAudioTranscription: {},
-
-              outputAudioTranscription: {},
             },
           },
-        },
-      });
+        });
 
-    return NextResponse.json({
-      token: token.name,
-      direction,
-      targetLanguageCode,
-    });
+      result.indonesiaToChinese =
+        token.name;
+
+      console.log(
+        "TOKEN 1 OK: ID -> ZH"
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      console.error(
+        "TOKEN 1 ERROR:",
+        message
+      );
+
+      result.errors.push(
+        `ID_TO_ZH: ${message}`
+      );
+    }
+
+    // ========================================
+    // TOKEN 2: MANDARIN -> INDONESIA
+    // ========================================
+    try {
+      const token =
+        await client.authTokens.create({
+          config: {
+            uses: 1,
+            expireTime,
+            newSessionExpireTime,
+
+            liveConnectConstraints: {
+              model:
+                "gemini-3.5-live-translate-preview",
+
+              config: {
+                responseModalities: [
+                  Modality.AUDIO,
+                ],
+
+                inputAudioTranscription: {},
+
+                outputAudioTranscription: {},
+
+                translationConfig: {
+                  targetLanguageCode:
+                    "id",
+                  echoTargetLanguage:
+                    false,
+                },
+              },
+            },
+          },
+        });
+
+      result.chineseToIndonesia =
+        token.name;
+
+      console.log(
+        "TOKEN 2 OK: ZH -> ID"
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      console.error(
+        "TOKEN 2 ERROR:",
+        message
+      );
+
+      result.errors.push(
+        `ZH_TO_ID: ${message}`
+      );
+    }
+
+    // ========================================
+    // TOKEN 3: AUTO TRANSCRIBE
+    // ========================================
+    try {
+      const token =
+        await client.authTokens.create({
+          config: {
+            uses: 1,
+            expireTime,
+            newSessionExpireTime,
+
+            liveConnectConstraints: {
+              model:
+                "gemini-3.5-transcribe-live",
+
+              config: {
+                responseModalities: [
+                  Modality.TEXT,
+                ],
+
+                inputAudioTranscription: {
+                  languageCodes: [],
+                },
+              },
+            },
+          },
+        });
+
+      result.transcribe =
+        token.name;
+
+      console.log(
+        "TOKEN 3 OK: TRANSCRIBE"
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      console.error(
+        "TOKEN 3 ERROR:",
+        message
+      );
+
+      result.errors.push(
+        `TRANSCRIBE: ${message}`
+      );
+    }
+
+    // ========================================
+    // RETURN SELALU JSON
+    // ========================================
+    const success =
+      Boolean(
+        result.indonesiaToChinese &&
+          result.chineseToIndonesia &&
+          result.transcribe
+      );
+
+    return NextResponse.json(
+      result,
+      {
+        status: success ? 200 : 500,
+      }
+    );
   } catch (error) {
     console.error(
-      "EPHEMERAL_TOKEN_ERROR",
+      "TOKEN_ROUTE_FATAL:",
       error
     );
 
@@ -88,7 +226,7 @@ export async function GET(
         error:
           error instanceof Error
             ? error.message
-            : "Gagal membuat ephemeral token.",
+            : String(error),
       },
       { status: 500 }
     );
